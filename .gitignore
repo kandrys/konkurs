@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+nvim.log
+
+# checkpoints and processed images
+*.pt
+processed/
+
+# raw contest photos (too large for GitHub)
+data/Test_All_Photos/
+data/Training-All_Photos_updated/
