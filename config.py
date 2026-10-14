@@ -15,4 +15,6 @@ class Config:
     seed: int
     epochs: int
     eval_stride: int
+    unfreeze_last: int = 0
+    lr_backbone: float = 1e-6
     target_ppm: float = 4.55

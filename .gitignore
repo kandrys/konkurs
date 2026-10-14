@@ -5,6 +5,7 @@ nvim.log
 
 # checkpoints and processed images
 *.pt
+*.npz
 processed/
 
 # raw contest photos (too large for GitHub)

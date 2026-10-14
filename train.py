@@ -18,6 +18,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from scipy.optimize import curve_fit
+
 
 import cv2
 import csv 
@@ -28,6 +30,7 @@ from transformers import AutoModel, AutoImageProcessor
 
 
 TARGET_PPM = Config.target_ppm
+D = np.array([0.002, 0.0063, 0.02, 0.063, 0.2, 0.63, 2.0, 6.3, 20.0, 63.0, 200.0], dtype=np.float64)
 
 def seed_everything(seed: int) -> None:
     random.seed(seed)
@@ -142,7 +145,8 @@ def read_labels(path: Path)-> Dict:
 def build_transforms(train: bool,cfg: Config):
     if train: 
         return A.Compose([
-            A.RandomResizedCrop(size=(cfg.crop_size,cfg.crop_size),scale=(0.7,1.0),p=1.0),
+            A.PadIfNeeded(min_height=cfg.crop_size, min_width=cfg.crop_size, border_mode=cv2.BORDER_REFLECT_101, p=1.0),
+            A.RandomCrop(height=cfg.crop_size, width=cfg.crop_size, p=1.0),
             A.D4(p=1.0),
             A.OneOf([
                 A.Illumination(mode="linear",   intensity_range=(0.05, 0.2), effect_type="both"),
@@ -234,11 +238,63 @@ def get_prefix_tokens_from_hf_config(cfg) -> int:
     return 1 + n_reg  # CLS + registers
 
 
+def _encoder_layers(backbone: nn.Module) -> nn.ModuleList:
+    enc = getattr(backbone, "encoder", None)
+    layers = getattr(enc, "layer", None) if enc is not None else None
+    if layers is None:
+        raise RuntimeError("Could not find backbone.encoder.layer (not a DINOv2 HF model?)")
+    return layers
+
+
+def set_backbone_trainable(backbone: nn.Module, unfreeze_last: int) -> None:
+    for p in backbone.parameters():
+        p.requires_grad = False
+    if unfreeze_last <= 0:
+        return
+    layers = _encoder_layers(backbone)
+    k = min(unfreeze_last, len(layers))
+    for layer in layers[-k:]:
+        for p in layer.parameters():
+            p.requires_grad = True
+    ln = getattr(backbone, "layernorm", None)
+    if ln is not None:
+        for p in ln.parameters():
+            p.requires_grad = True
+    print(f"unfroze last {k}/{len(layers)} encoder blocks + layernorm")
+def weibull_np(d, lam, k):
+    return 1.0 - np.exp(-np.power(np.clip(d / lam, 1e-12, None), k))
+def fit_weibull(cdf01):  # cdf in [0,1], length 11
+    y = np.clip(cdf01[:10], 1e-4, 1 - 1e-4) 
+    (lam, k), _ = curve_fit(
+        weibull_np, D[:10], y,
+        p0=(1.0, 1.0),
+        bounds=([1e-4, 0.15], [80.0, 8.0]),
+        maxfev=20000,
+    )
+    return lam, k
+def weibull_cdf(ln_lam: torch.Tensor, k: torch.Tensor, x_sup: torch.Tensor) -> torch.Tensor:
+    lam = torch.exp(ln_lam).clamp(1e-4, 80.0)
+    k = torch.nn.functional.softplus(k) + 0.2  
+    d = x_sup.to(ln_lam.device).unsqueeze(0)   
+    log_arg = k.unsqueeze(1) * (torch.log(d) - torch.log(lam).unsqueeze(1))
+    log_arg = log_arg.clamp(max=20.0)
+    F = 1.0 - torch.exp(-torch.exp(log_arg))
+    F = F.clamp(0.0, 1.0)
+    F[:, -1] = 1.0
+    return F  # [B, 11]
 class ViT(nn.Module):
-    def __init__(self,backbone:nn.Module,freeze_backbone = False):
+    def __init__(
+        self,
+        backbone: nn.Module,
+        x_sup: np.ndarray,
+        freeze_backbone: bool = False,
+        unfreeze_last: int = 0,
+    ):
         super().__init__()
         self.backbone = backbone
-        self.freeze_backbone = freeze_backbone
+        self.register_buffer("x_sup", torch.as_tensor(x_sup, dtype=torch.float32))
+        self.unfreeze_last = unfreeze_last
+        self.backbone_no_grad = bool(freeze_backbone) and unfreeze_last <= 0
         cfg = backbone.config
         self.patch_size = get_patch_size_from_hf_config(cfg)
         self.num_prefix_tokens = get_prefix_tokens_from_hf_config(cfg)
@@ -251,28 +307,27 @@ class ViT(nn.Module):
                 nn.Linear(1152,256),
                 nn.GELU(),
                 nn.Dropout(p=0.5),
-                nn.Linear(256,11),
+                nn.Linear(256,2 ),
                 )
         if freeze_backbone:
-            for p in self.backbone.parameters():
-                p.requires_grad= False
-            self.backbone.eval()
+            set_backbone_trainable(self.backbone, unfreeze_last)
+            if self.backbone_no_grad:
+                self.backbone.eval()
     def train(self,mode:bool = True):
         super().train(mode)
-        if self.freeze_backbone:
+        if self.backbone_no_grad:
             self.backbone.eval()
         return self
     def forward(self, x:torch.Tensor) -> torch.Tensor:
-            
-        if self.freeze_backbone:
-                
+        if self.backbone_no_grad:
             with torch.no_grad():
-                    
-                out = self.backbone(pixel_values=x,return_dict=True,interpolate_pos_encoding = True)
-            
+                out = self.backbone(
+                    pixel_values=x, return_dict=True, interpolate_pos_encoding=True
+                )
         else:
-                
-            out = self.backbone(pixel_values=x,return_dict=True,interpolate_pos_encoding = True)
+            out = self.backbone(
+                pixel_values=x, return_dict=True, interpolate_pos_encoding=True
+            )
 
         t = out.last_hidden_state
         patch_tokens =t[:,self.num_prefix_tokens:,:]
@@ -283,8 +338,10 @@ class ViT(nn.Module):
             raise RuntimeError(f"Expected square patch grid, got n={n}")
         mean_patch = patch_tokens.mean(dim=1)
         std_patch = patch_tokens.std(dim=1)
-        global_feat = torch.cat([cls_token,mean_patch,std_patch],dim=1)
-        return torch.cumsum(torch.softmax(self.head(global_feat),dim=1),dim=1)
+        global_feat = torch.cat([cls_token,mean_patch,std_patch],dim=1)#
+        raw = self.head(global_feat)          # [B, 2]
+        ln_lam, k_raw = raw[:, 0], raw[:, 1]
+        return weibull_cdf(ln_lam, k_raw, self.x_sup)
 
 def _hf_from_pretrained(model_id: str, *, attn_impl: str) -> nn.Module:
     """
@@ -338,6 +395,27 @@ def build_backbone_and_meta(model_id: str, rank0: bool) -> Tuple[nn.Module, Dict
     }
     return backbone, meta
 
+def report_weibull_label_fit(labels: Dict, x_sup: np.ndarray) -> float:
+    scores = []
+    for sid, cdf in labels.items():
+        y = np.asarray(cdf, dtype=np.float64)
+        try:
+            lam, k = fit_weibull(y)
+        except Exception as e:
+            print(f"  weibull fit {sid}: FAILED {type(e).__name__}: {e}")
+            continue
+        pred = torch.tensor(weibull_np(D, lam, k), dtype=torch.float32).unsqueeze(0)
+        tgt = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
+        emd = EMD_loss(pred, tgt, x_sup).item() * 100
+        scores.append(emd)
+        print(f"  weibull fit {sid}: λ={lam:.4f} k={k:.4f} emd={emd:.2f}")
+    if not scores:
+        raise RuntimeError("Weibull fit failed for every sample")
+    mean_emd = float(sum(scores) / len(scores))
+    print(f"weibull label-fit mean EMD={mean_emd:.2f}  (n={len(scores)}/{len(labels)})")
+    return mean_emd
+
+
 def EMD_loss(pred:torch.Tensor,targets:torch.Tensor,x_sup:np.ndarray) -> torch.Tensor:
     x1 = torch.tensor(x_sup,dtype = torch.float32)
     w = torch.log10(x1[1:]) - torch.log10(x1[:-1])
@@ -378,7 +456,8 @@ def train_one_epoch(
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
-    print(f"LR na koniec epoki: {optimizer.param_groups[0]['lr']}")
+    lrs = ", ".join(f"{g['lr']:.2e}" for g in optimizer.param_groups)
+    print(f"LR na koniec epoki: {lrs}")
     return total / max(n,1)
 def sample_id_of(stem: str) -> str:
     return stem.split("_")[-2]
@@ -453,6 +532,9 @@ def main():
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-5)
+    p.add_argument("--lr_backbone", type=float, default=1e-6)
+    p.add_argument("--unfreeze_last", type=int, default=0)
+    p.add_argument("--ckpt", type=Path, default=None)
     p.add_argument("--accum_steps", type=int, default=1)
     p.add_argument("--model_name", type=str, default="facebook/dinov2-with-registers-small")
     args = p.parse_args()
@@ -467,6 +549,8 @@ def main():
         seed=args.seed,
         epochs=args.epochs,
         eval_stride=448,
+        unfreeze_last=args.unfreeze_last,
+        lr_backbone=args.lr_backbone,
     )
     seed_everything(cfg.seed)
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
@@ -475,22 +559,37 @@ def main():
     root = Path(__file__).parent
     imgs = load_image_from_processed(root / "processed")
     labels = read_labels(root / "data")
+    report_weibull_label_fit(labels, x_sup)
 
     backbone, meta = build_backbone_and_meta(args.model_name, rank0=True)
     print(f"backbone={meta['model_id']} attn={meta['attn_implementation']} dim={meta['embed_dim']}")
-    model = ViT(backbone, freeze_backbone=cfg.freeze_backbone).to(device)
+    model = ViT(
+        backbone,
+        x_sup,
+        freeze_backbone=cfg.freeze_backbone,
+        unfreeze_last=cfg.unfreeze_last,
+    ).to(device)
+    if args.ckpt is not None:
+        sd = torch.load(args.ckpt, map_location=device, weights_only=True)
+        model.load_state_dict(sd, strict=True)
+        print(f"loaded ckpt {args.ckpt}")
 
     dl_train, dl_eval, val_ds = create_dataloaders(imgs, labels, cfg)
     print(
         f"train images={len(dl_train.dataset.samples)} "
         f"val images={len(val_ds.samples)} val tiles={len(val_ds)}"
     )
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"trainable params={n_train} unfreeze_last={cfg.unfreeze_last}")
 
-    optimizer = torch.optim.AdamW(
-        [par for par in model.parameters() if par.requires_grad],
-        lr=cfg.lr,
-        weight_decay=args.weight_decay,
-    )
+    head_params = [p for p in model.head.parameters() if p.requires_grad]
+    backbone_params = [
+        p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("head.")
+    ]
+    param_groups = [{"params": head_params, "lr": cfg.lr}]
+    if backbone_params:
+        param_groups.append({"params": backbone_params, "lr": cfg.lr_backbone})
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=args.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=3)
 
     best_val = float("inf")
@@ -506,9 +605,9 @@ def main():
         )
         val_loss = validate(model, dl_eval, val_ds, x_sup, device)
         scheduler.step(val_loss)
-        lr_now = optimizer.param_groups[0]["lr"]
+        lrs = "/".join(f"{g['lr']:.2e}" for g in optimizer.param_groups)
         print(
-            f"Epoch {epoch:02d} | lr={lr_now:.2e} | "
+            f"Epoch {epoch:02d} | lr={lrs} | "
             f"train_loss={train_loss:.5f} | val_emd={val_loss:.2f}"
         )
         if val_loss < best_val:
