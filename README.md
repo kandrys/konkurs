@@ -22,8 +22,6 @@ Optional: `--unfreeze_last N` with a lower `--lr_backbone` (last encoder blocks 
 | Frozen DINOv2-S + Weibull, Android val (5 soils) | **31.94** |
 
 
-Public LB is 3 of 10 test soils. The jump 32 → 64 is mainly the phone domain gap, not a broken submission file.
-
 ## Repository layout
 
 ```
